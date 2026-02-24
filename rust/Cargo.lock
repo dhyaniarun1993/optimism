@@ -8008,6 +8008,7 @@ version = "1.11.0"
 dependencies = [
  "clap",
  "reth-cli-util",
+ "reth-db",
  "reth-optimism-chainspec",
  "reth-optimism-cli",
  "reth-optimism-consensus",
