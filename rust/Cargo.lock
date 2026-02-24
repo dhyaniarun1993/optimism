@@ -8007,8 +8007,10 @@ name = "op-reth"
 version = "1.11.0"
 dependencies = [
  "clap",
+ "eyre",
  "reth-cli-util",
  "reth-db",
+ "reth-node-builder",
  "reth-optimism-chainspec",
  "reth-optimism-cli",
  "reth-optimism-consensus",
