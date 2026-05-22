@@ -1963,3 +1963,273 @@ fn storage_trie_history_cursor_walk_returns_lex_by_nibble_order() {
 
     assert_eq!(walked, vec![long, short], "within an address, [0x01, 0x05] must precede [0x05]",);
 }
+
+// ========================== Batch path regressions ==========================
+//
+// These exercise `store_trie_updates_batch` for scenarios where the same address
+// is touched by multiple blocks in a single batch. The cursors and history
+// collector are shared across blocks within one batch, so a block's writes
+// must be visible to subsequent blocks' reads in the same transaction.
+//
+// Motivation: during normal execute_block-driven catch-up, the engine reads the
+// proofs storage at `parent_block_number == in-memory tip`, which is always
+// >= storage's persisted latest. `is_latest_block(max_block_number)` returns
+// true, and the cursors bypass history+changesets entirely — current-state
+// tables are read directly. A corrupted current-state row would surface
+// immediately as a state-root mismatch in the next block.
+
+/// Block N adds slots to address A; block N+1 wipes A and adds a different slot
+/// — all in one batch. The current-state table must end up with only block
+/// N+1's slot for A.
+#[test]
+fn batch_hashed_storages_wipe_after_add_same_address() {
+    let db = setup_db();
+
+    let addr = B256::from([0xA1; 32]);
+    let s_init = B256::from([0x01; 32]);
+    let s_added = B256::from([0x02; 32]);
+    let s_post_wipe = B256::from([0x03; 32]);
+
+    // Seed: A has {s_init: 10}
+    {
+        let provider = MdbxProofsProviderV2::new(db.tx_mut().expect("rw"));
+        provider.store_hashed_storages(addr, vec![(s_init, U256::from(10u64))]).expect("seed");
+        provider.set_initial_state_anchor(BlockNumHash::new(0, B256::ZERO)).expect("anchor");
+        provider.commit_initial_state().expect("commit init");
+        OpProofsInitProvider::commit(provider).expect("commit");
+    }
+
+    // Block 1: add slot s_added (non-wiped update)
+    let mut ps1 = HashedPostState::default();
+    let mut st1 = HashedStorage::default();
+    st1.storage.insert(s_added, U256::from(20u64));
+    ps1.storages.insert(addr, st1);
+    let diff1 = BlockStateDiff {
+        sorted_trie_updates: TrieUpdates::default().into_sorted(),
+        sorted_post_state: ps1.into_sorted(),
+    };
+    let b1 = make_block_ref(1, B256::repeat_byte(0x01), B256::ZERO);
+
+    // Block 2: wipe A, add s_post_wipe
+    let mut ps2 = HashedPostState::default();
+    let mut st2 = HashedStorage::new(true);
+    st2.storage.insert(s_post_wipe, U256::from(30u64));
+    ps2.storages.insert(addr, st2);
+    let diff2 = BlockStateDiff {
+        sorted_trie_updates: TrieUpdates::default().into_sorted(),
+        sorted_post_state: ps2.into_sorted(),
+    };
+    let b2 = make_block_ref(2, B256::repeat_byte(0x02), B256::repeat_byte(0x01));
+
+    // Batch write both blocks
+    {
+        let provider = MdbxProofsProviderV2::new(db.tx_mut().expect("rw"));
+        provider.store_trie_updates_batch(vec![(b1, diff1), (b2, diff2)]).expect("batch");
+        OpProofsProviderRw::commit(provider).expect("commit");
+    }
+
+    // Current state: only s_post_wipe present for A, with block 2's value
+    let slots = collect_hashed_storage_slots(&db, addr);
+    assert_eq!(slots.len(), 1, "after batch wipe+add: exactly 1 entry");
+    assert_eq!(slots[0], (s_post_wipe, U256::from(30u64)));
+}
+
+/// Storage-trie analogue of the test above: block N adds a node for address A;
+/// block N+1 wipes A's storage trie and adds a different node — all in one
+/// batch. The current-state table must end up with only block N+1's node.
+#[test]
+fn batch_storage_trie_wipe_after_add_same_address() {
+    let db = setup_db();
+
+    let addr = B256::from([0xB2; 32]);
+    let p_init = Nibbles::from_nibbles_unchecked([0x01]);
+    let p_added = Nibbles::from_nibbles_unchecked([0x02]);
+    let p_post_wipe = Nibbles::from_nibbles_unchecked([0x03]);
+    let node_init = sample_node();
+    let node_added = BranchNodeCompact::new(0b10, 0, 0, vec![], Some(B256::repeat_byte(0xCD)));
+    let node_post_wipe =
+        BranchNodeCompact::new(0b100, 0, 0, vec![], Some(B256::repeat_byte(0xEF)));
+
+    // Seed: A's storage trie has node at p_init
+    {
+        let provider = MdbxProofsProviderV2::new(db.tx_mut().expect("rw"));
+        provider.store_storage_branches(addr, vec![(p_init, Some(node_init))]).expect("seed");
+        provider.set_initial_state_anchor(BlockNumHash::new(0, B256::ZERO)).expect("anchor");
+        provider.commit_initial_state().expect("commit init");
+        OpProofsInitProvider::commit(provider).expect("commit");
+    }
+
+    // Block 1: add p_added (non-wiped)
+    let mut tu1 = TrieUpdates::default();
+    let mut st1 = StorageTrieUpdates::default();
+    st1.storage_nodes.insert(p_added, node_added.clone());
+    tu1.storage_tries.insert(addr, st1);
+    let diff1 = BlockStateDiff {
+        sorted_trie_updates: tu1.into_sorted(),
+        sorted_post_state: HashedPostState::default().into_sorted(),
+    };
+    let b1 = make_block_ref(1, B256::repeat_byte(0x01), B256::ZERO);
+
+    // Block 2: wipe A's storage trie, add p_post_wipe
+    let mut tu2 = TrieUpdates::default();
+    let mut st2 = StorageTrieUpdates::default();
+    st2.set_deleted(true);
+    st2.storage_nodes.insert(p_post_wipe, node_post_wipe.clone());
+    tu2.storage_tries.insert(addr, st2);
+    let diff2 = BlockStateDiff {
+        sorted_trie_updates: tu2.into_sorted(),
+        sorted_post_state: HashedPostState::default().into_sorted(),
+    };
+    let b2 = make_block_ref(2, B256::repeat_byte(0x02), B256::repeat_byte(0x01));
+
+    {
+        let provider = MdbxProofsProviderV2::new(db.tx_mut().expect("rw"));
+        provider.store_trie_updates_batch(vec![(b1, diff1), (b2, diff2)]).expect("batch");
+        OpProofsProviderRw::commit(provider).expect("commit");
+    }
+
+    // Current state for A: only p_post_wipe's node, nothing else
+    let tx = db.tx().expect("ro");
+    let mut cur = tx.cursor_dup_read::<V2StoragesTrie>().expect("cursor");
+    let mut walked = Vec::new();
+    if let Some((_, entry)) = cur.seek_exact(addr).expect("seek") {
+        walked.push((entry.nibbles.0, entry.node));
+        while let Some((_, entry)) = cur.next_dup().expect("next") {
+            walked.push((entry.nibbles.0, entry.node));
+        }
+    }
+    assert_eq!(walked.len(), 1, "expected exactly one storage-trie node for A");
+    assert_eq!(walked[0].0, p_post_wipe);
+    assert_eq!(walked[0].1, node_post_wipe);
+}
+
+/// Within one batch: block N updates account A and its storage; block N+1
+/// destroys A (`account = None`) and wipes storage. Current-state tables must
+/// have nothing for A in either V2HashedAccounts or V2HashedStorages.
+#[test]
+fn batch_destroy_account_with_storage_wipe() {
+    let db = setup_db();
+
+    let addr = B256::from([0xC3; 32]);
+    let slot = B256::from([0xAA; 32]);
+    let acc_seed = Account { nonce: 1, balance: U256::from(100u64), ..Default::default() };
+    let acc_b1 = Account { nonce: 2, balance: U256::from(200u64), ..Default::default() };
+
+    // Seed: A exists with one slot
+    {
+        let provider = MdbxProofsProviderV2::new(db.tx_mut().expect("rw"));
+        provider.store_hashed_accounts(vec![(addr, Some(acc_seed))]).expect("seed account");
+        provider.store_hashed_storages(addr, vec![(slot, U256::from(50u64))]).expect("seed storage");
+        provider.set_initial_state_anchor(BlockNumHash::new(0, B256::ZERO)).expect("anchor");
+        provider.commit_initial_state().expect("commit init");
+        OpProofsInitProvider::commit(provider).expect("commit");
+    }
+
+    // Block 1: bump account; bump slot value
+    let mut ps1 = HashedPostState::default();
+    ps1.accounts.insert(addr, Some(acc_b1));
+    let mut st1 = HashedStorage::default();
+    st1.storage.insert(slot, U256::from(60u64));
+    ps1.storages.insert(addr, st1);
+    let diff1 = BlockStateDiff {
+        sorted_trie_updates: TrieUpdates::default().into_sorted(),
+        sorted_post_state: ps1.into_sorted(),
+    };
+    let b1 = make_block_ref(1, B256::repeat_byte(0x01), B256::ZERO);
+
+    // Block 2: destroy A + wipe its storage (SELFDESTRUCT in same batch)
+    let mut ps2 = HashedPostState::default();
+    ps2.accounts.insert(addr, None);
+    ps2.storages.insert(addr, HashedStorage::new(true));
+    let diff2 = BlockStateDiff {
+        sorted_trie_updates: TrieUpdates::default().into_sorted(),
+        sorted_post_state: ps2.into_sorted(),
+    };
+    let b2 = make_block_ref(2, B256::repeat_byte(0x02), B256::repeat_byte(0x01));
+
+    {
+        let provider = MdbxProofsProviderV2::new(db.tx_mut().expect("rw"));
+        provider.store_trie_updates_batch(vec![(b1, diff1), (b2, diff2)]).expect("batch");
+        OpProofsProviderRw::commit(provider).expect("commit");
+    }
+
+    // V2HashedAccounts: A gone
+    {
+        let tx = db.tx().expect("ro");
+        let mut cur = tx.cursor_read::<V2HashedAccounts>().expect("cursor");
+        assert!(cur.seek_exact(addr).expect("seek").is_none(), "destroyed account must be absent");
+    }
+
+    // V2HashedStorages: nothing for A
+    assert!(collect_hashed_storage_slots(&db, addr).is_empty(), "wiped storage must be empty");
+}
+
+/// In a batch: block N writes data, block N+1 is an empty `BlockStateDiff`,
+/// block N+2 writes more data. Current state must reflect block N+2's writes
+/// on top of N's, and the `latest` pointer must advance to N+2 even though the
+/// middle block contributed no changesets.
+#[test]
+fn batch_empty_middle_block_advances_latest() {
+    let db = setup_db();
+
+    let addr = B256::from([0xD4; 32]);
+    let slot = B256::from([0xBB; 32]);
+
+    // Seed: A has slot = v0
+    {
+        let provider = MdbxProofsProviderV2::new(db.tx_mut().expect("rw"));
+        provider.store_hashed_storages(addr, vec![(slot, U256::from(1u64))]).expect("seed");
+        provider.set_initial_state_anchor(BlockNumHash::new(0, B256::ZERO)).expect("anchor");
+        provider.commit_initial_state().expect("commit init");
+        OpProofsInitProvider::commit(provider).expect("commit");
+    }
+
+    // Block 1: slot = 100
+    let mut ps1 = HashedPostState::default();
+    let mut st1 = HashedStorage::default();
+    st1.storage.insert(slot, U256::from(100u64));
+    ps1.storages.insert(addr, st1);
+    let diff1 = BlockStateDiff {
+        sorted_trie_updates: TrieUpdates::default().into_sorted(),
+        sorted_post_state: ps1.into_sorted(),
+    };
+    let b1 = make_block_ref(1, B256::repeat_byte(0x01), B256::ZERO);
+
+    // Block 2: empty
+    let diff2 = BlockStateDiff::default();
+    let b2 = make_block_ref(2, B256::repeat_byte(0x02), B256::repeat_byte(0x01));
+
+    // Block 3: slot = 300
+    let mut ps3 = HashedPostState::default();
+    let mut st3 = HashedStorage::default();
+    st3.storage.insert(slot, U256::from(300u64));
+    ps3.storages.insert(addr, st3);
+    let diff3 = BlockStateDiff {
+        sorted_trie_updates: TrieUpdates::default().into_sorted(),
+        sorted_post_state: ps3.into_sorted(),
+    };
+    let b3 = make_block_ref(3, B256::repeat_byte(0x03), B256::repeat_byte(0x02));
+
+    {
+        let provider = MdbxProofsProviderV2::new(db.tx_mut().expect("rw"));
+        provider
+            .store_trie_updates_batch(vec![(b1, diff1), (b2, diff2), (b3, diff3)])
+            .expect("batch");
+        OpProofsProviderRw::commit(provider).expect("commit");
+    }
+
+    // Current state: slot = 300
+    let slots = collect_hashed_storage_slots(&db, addr);
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0], (slot, U256::from(300u64)));
+
+    // Latest pointer advanced through the empty middle block
+    {
+        let tx = db.tx().expect("ro");
+        let mut cur = tx.cursor_read::<V2ProofWindow>().expect("cursor");
+        let (_, latest) =
+            cur.seek_exact(ProofWindowKey::LatestBlock).expect("seek").expect("exists");
+        assert_eq!(latest.number(), 3, "latest must reflect block 3");
+        assert_eq!(*latest.hash(), B256::repeat_byte(0x03));
+    }
+}
