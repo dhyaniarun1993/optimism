@@ -12,7 +12,7 @@ use reth_provider::{
     BlockHashReader, BlockReader, DatabaseProviderFactory, HashedPostStateProvider, ProviderError,
     StateProviderFactory, StateReader, StateRootProvider,
 };
-use reth_revm::database::StateProviderDatabase;
+use reth_revm::{database::StateProviderDatabase, db::BundleState};
 use reth_trie::{StateRoot, TrieInput};
 use std::time::Instant;
 use tracing::{debug, error, info};
@@ -136,6 +136,7 @@ where
             parent_block_number,
             state_root,
             block.state_root(),
+            &execution_result.state,
             &state_provider,
             &state.provider,
             &state.storage,
@@ -209,6 +210,7 @@ fn log_state_root_mismatch_diagnostic<S, P, Store>(
     parent_block_number: u64,
     computed: B256,
     expected: B256,
+    bundle: &BundleState,
     state_provider: &S,
     reth_provider: &P,
     storage: &Store,
@@ -280,6 +282,78 @@ fn log_state_root_mismatch_diagnostic<S, P, Store>(
             matches_or_unknown(composed_at_parent_root, canonical_parent_root),
         "StateRootMismatch diagnostic",
     );
+
+    log_bundle_dump(bundle);
+}
+
+/// Cap on the per-entry log lines emitted by [`log_bundle_dump`].
+const MAX_BUNDLE_ACCOUNT_LINES: usize = 50;
+const MAX_BUNDLE_SLOT_LINES: usize = 200;
+
+/// Dumps every changed account and storage slot in `bundle`, sorted by address so output is
+/// stable across retries and easy to diff against a canonical archive RPC.
+///
+/// Each account line shows `(nonce, balance, code_hash)` for both the original (parent-state)
+/// and new (post-block) values, with `None` indicating "did not exist". Each storage line shows
+/// `original_value -> present_value` for the slot.
+///
+/// To localize a [`EngineError::StateRootMismatch`]: pick a known system contract (OP Stack
+/// predeploys at `0x4200…000F` `GasPriceOracle`, `0x4200…0015` `L1Block`, `0x4200…0019`
+/// `BaseFeeVault`, `0x4200…001A` `L1FeeVault`, `0x4200…0011` `SequencerFeeVault`), look up the
+/// canonical value at this block via an archive RPC's `eth_getProof`, and compare.
+fn log_bundle_dump(bundle: &BundleState) {
+    let mut accounts: Vec<_> = bundle.state.iter().collect();
+    accounts.sort_by_key(|(addr, _)| **addr);
+
+    let total_accounts = accounts.len();
+    let total_slots: usize = accounts.iter().map(|(_, ba)| ba.storage.len()).sum();
+
+    error!(
+        target: "trie::engine::task",
+        total_accounts,
+        total_slots,
+        account_lines_logged = total_accounts.min(MAX_BUNDLE_ACCOUNT_LINES),
+        slot_lines_logged = total_slots.min(MAX_BUNDLE_SLOT_LINES),
+        "Bundle dump for failing block (sorted by address)",
+    );
+
+    for (addr, ba) in accounts.iter().take(MAX_BUNDLE_ACCOUNT_LINES) {
+        let original = ba.original_info.as_ref().map(|i| (i.nonce, i.balance, i.code_hash));
+        let new = ba.info.as_ref().map(|i| (i.nonce, i.balance, i.code_hash));
+        error!(
+            target: "trie::engine::task",
+            ?addr,
+            status = ?ba.status,
+            original = ?original,
+            new = ?new,
+            "bundle account",
+        );
+    }
+
+    // Slots: flatten into a single sorted Vec so we can apply one global cap. This avoids the
+    // surprise where a single chatty account eats the whole budget.
+    let mut slots: Vec<_> = accounts
+        .iter()
+        .flat_map(|(addr, ba)| {
+            let addr = **addr;
+            ba.storage.iter().map(move |(slot, s)| {
+                (addr, B256::from(*slot), s.previous_or_original_value, s.present_value)
+            })
+        })
+        .collect();
+    slots.sort_by_key(|(addr, slot, _, _)| (*addr, *slot));
+
+    for (addr, slot, original_value, present_value) in slots.into_iter().take(MAX_BUNDLE_SLOT_LINES)
+    {
+        error!(
+            target: "trie::engine::task",
+            ?addr,
+            ?slot,
+            ?original_value,
+            ?present_value,
+            "bundle slot",
+        );
+    }
 }
 
 /// Three-way result for "do two optionally-known roots agree?".
