@@ -130,8 +130,7 @@ where
         // Localize the divergence by comparing our view's trie root at parent against the
         // canonical state_root recorded in reth's block headers. Headers are retained even
         // when reth has pruned the historical state, so this works even when the proofs
-        // engine is far behind reth's tip. The runner backs off exponentially, so this
-        // diagnostic won't spin even if the failure persists.
+        // engine is far behind reth's tip.
         log_state_root_mismatch_diagnostic(
             block.number(),
             parent_block_number,
@@ -142,11 +141,16 @@ where
             &state.storage,
         );
 
-        return Err(EngineError::StateRootMismatch {
-            block_number: block.number(),
-            current_state_hash: state_root,
-            expected_state_hash: block.state_root(),
-        });
+        // Panic to stop the retry loop after a single diagnostic emission. The engine thread
+        // is wrapped in `panic::catch_unwind` (see EngineHandle::spawn_with_thresholds), so
+        // this kills the engine cleanly without taking down the rest of the node. Remove
+        // once the bug is fixed.
+        panic!(
+            "StateRootMismatch at block {} (computed {:?}, expected {:?}) — see diagnostic line above",
+            block.number(),
+            state_root,
+            block.state_root(),
+        );
     }
 
     let sorted_trie_updates = trie_updates.into_sorted();
